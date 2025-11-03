@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -18,7 +19,9 @@ const (
 	// workspaces is the Metric subsystem we use.
 	workspacesSubsystem = "workspaces"
 	// Selecting a page size of 100 to minimize number of requests for larger  workspace deployments
-	pageSize = 100
+	pageSize                 = 100
+	maxConcurrentPageFetches = 20
+	perPageRequestTimeout    = 15 * time.Second
 )
 
 // Metric descriptors.
@@ -53,7 +56,10 @@ func (ScrapeWorkspaces) Version() string {
 }
 
 func getWorkspacesListPage(ctx context.Context, page int, organization string, config *setup.Config, ch chan<- prometheus.Metric) error {
-	workspacesList, err := config.Client.Workspaces.List(ctx, organization, &tfe.WorkspaceListOptions{
+	pageCtx, cancel := context.WithTimeout(ctx, perPageRequestTimeout)
+	defer cancel()
+
+	workspacesList, err := config.Client.Workspaces.List(pageCtx, organization, &tfe.WorkspaceListOptions{
 		ListOptions: tfe.ListOptions{
 			PageSize:   pageSize,
 			PageNumber: page,
@@ -67,7 +73,13 @@ func getWorkspacesListPage(ctx context.Context, page int, organization string, c
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("%v, (organization=%s, page=%d)", err, organization, page)
+		select {
+		case <-ctx.Done():
+			// parent context canceled — stop quietly
+			return ctx.Err()
+		default:
+			return fmt.Errorf("%v (organization=%s, page=%d)", err, organization, page)
+		}
 	}
 
 	for _, w := range workspacesList.Items {
@@ -105,7 +117,6 @@ func getWorkspacesListPage(ctx context.Context, page int, organization string, c
 
 // Scrape collects data from Terraform API and sends it over channel as prometheus metric.
 func (ScrapeWorkspaces) Scrape(ctx context.Context, config *setup.Config, ch chan<- prometheus.Metric) error {
-	const maxConcurrentPageFetches = 100 // tune as needed
 	g, ctx := errgroup.WithContext(ctx)
 	sem := make(chan struct{}, maxConcurrentPageFetches)
 
@@ -117,7 +128,6 @@ func (ScrapeWorkspaces) Scrape(ctx context.Context, config *setup.Config, ch cha
 					PageSize: pageSize,
 				},
 			})
-
 			if err != nil {
 				return fmt.Errorf("%v, organization=%s", err, name)
 			}
@@ -126,11 +136,16 @@ func (ScrapeWorkspaces) Scrape(ctx context.Context, config *setup.Config, ch cha
 			for i := 1; i <= workspacesList.Pagination.TotalPages; i++ {
 				i := i
 				pageErrs.Go(func() error {
-					sem <- struct{}{} // acquire
-					defer func() { <-sem }() // release
-					return getWorkspacesListPage(pageCtx, i, name, config, ch)
+					select {
+					case sem <- struct{}{}:
+						defer func() { <-sem }()
+						return getWorkspacesListPage(pageCtx, i, name, config, ch)
+					case <-pageCtx.Done():
+						return pageCtx.Err()
+					}
 				})
 			}
+
 			return pageErrs.Wait()
 		})
 	}
@@ -164,7 +179,6 @@ func getCurrentRunCreatedAt(r *tfe.Run) string {
 
 // Getting current Billible Resources Under Management (RUM)
 func getCurrentRUM(s *tfe.StateVersion) string {
-
 	if s == nil {
 		return "0"
 	}

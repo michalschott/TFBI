@@ -100,13 +100,34 @@ func (e *Exporter) scrape(ctx context.Context, ch chan<- prometheus.Metric) {
 		go func(scraper Scraper) {
 			defer wg.Done()
 			label := "collect." + scraper.Name()
-			scrapeTime := time.Now()
-			if err := scraper.Scrape(ctx, &e.config, ch); err != nil {
+			start := time.Now()
+
+			scraperTimeout := 2 * time.Minute
+			scrapeCtx, cancel := context.WithTimeout(ctx, scraperTimeout)
+			defer cancel()
+
+			err := scraper.Scrape(scrapeCtx, &e.config, ch)
+			duration := time.Since(start).Seconds()
+
+			ch <- prometheus.MustNewConstMetric(scrapeDurationDesc, prometheus.GaugeValue, duration, label)
+
+			switch {
+			case err == context.DeadlineExceeded:
+				level.Warn(e.logger).Log("msg", "scraper timed out", "scraper", scraper.Name(), "duration", duration)
+				e.metrics.ScrapeErrors.WithLabelValues(label).Inc()
+				e.metrics.Error.Set(1)
+
+			case err == context.Canceled:
+				level.Warn(e.logger).Log("msg", "scraper canceled", "scraper", scraper.Name(), "duration", duration)
+
+			case err != nil:
 				level.Error(e.logger).Log("msg", "Error from scraper", "scraper", scraper.Name(), "err", err)
 				e.metrics.ScrapeErrors.WithLabelValues(label).Inc()
 				e.metrics.Error.Set(1)
+
+			default:
+				level.Info(e.logger).Log("msg", "scraper completed", "scraper", scraper.Name(), "duration", duration)
 			}
-			ch <- prometheus.MustNewConstMetric(scrapeDurationDesc, prometheus.GaugeValue, time.Since(scrapeTime).Seconds(), label)
 		}(scraper)
 	}
 }
